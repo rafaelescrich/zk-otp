@@ -1,0 +1,657 @@
+% ZK-OTP: Action-Bound Zero-Knowledge Two-Factor Authorization for EOAs and Safes
+% Draft for IACR ePrint / systems-security workshop submission.
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{claim}{Claim}
+
+\newcommand{\Hash}{\mathsf{H}}       % Poseidon hash over BN254
+\newcommand{\keccak}{\mathsf{keccak}}
+\newcommand{\Fr}{\mathbb{F}_r}       % BN254 scalar field
+\newcommand{\secret}{\mathsf{s}}
+\newcommand{\salt}{\mathsf{r}}
+\newcommand{\commit}{\mathsf{C}}
+\newcommand{\chal}{\mathsf{ch}}
+\newcommand{\nul}{\mathsf{N}}
+
+\title{ZK-OTP: Action-Bound Zero-Knowledge Two-Factor Authorization\\
+for EOAs (EIP-7702) and Smart-Contract Wallets}
+\author{Rafael Escrich\thanks{Independent researcher. \texttt{rafael@unblockthechain.com}}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Second-factor authentication for blockchain accounts is today either off-chain
+(custodial 2FA, defeated once the key is exported) or coarse (multisig $m$-of-$n$,
+which authenticates \emph{signers}, not \emph{actions}). We present \textbf{ZK-OTP},
+a zero-knowledge one-time-authorization scheme that proves knowledge of a
+registered secret \emph{bound to a specific action}---the exact call batch, chain,
+verifying contract, monotonic nonce, and expiry---without revealing the secret and
+without an RFC-6238 shared-secret server. Our construction derives an
+action-specific challenge in-circuit and a nullifier as a \emph{circuit output}
+(not a prover input), eliminating a class of malleability and replay bugs. We show
+how to attach ZK-OTP to a plain externally-owned account (EOA) via \textbf{EIP-7702}
+delegation---adding a second factor \emph{without} changing or replacing the EOA
+key---and to institutional custody via a \textbf{Safe Module}. The same
+authentication circuit, with companion registration and rotation circuits, serves
+both integrations. We
+give a threat model, a security argument for action-binding, replay-, cross-chain-,
+and malleability-resistance, and an implementation over Poseidon/BN254 with a
+Groth16 proving path plus a migration path to transparent FRI-based proving.
+Across the three circuits ($240$--$1074$ R1CS constraints), Groth16 proofs are
+$256$~bytes, verify on-chain in $198$--$231$k gas, and generate in
+$581$--$887$\,ms in the reproducible snarkjs pipeline.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+% --- Motivation ---
+Account security on public blockchains is bimodal. Retail users hold a single
+secp256k1 key whose theft is total and irreversible; there is no ``second factor''
+that survives key export. Institutions use $m$-of-$n$ multisignature wallets (e.g.,
+Safe), which raise the bar on \emph{who} signs but authenticate \emph{principals},
+not \emph{operations}: a compromised threshold of signers authorizes anything.
+Meanwhile, the 2FA that Web2 users expect---TOTP (RFC 6238), push, passkeys---is
+either custodial (a server holds the shared secret) or not cryptographically bound
+to the on-chain action being authorized.
+
+% --- The opportunity: EIP-7702 ---
+\textbf{EIP-7702} changes the design space. It lets an EOA set a persistent
+delegation indicator pointing to contract code, so an
+ordinary EOA can, for the first time, enforce arbitrary authorization logic
+\emph{in its own storage context} while keeping its address and key. The
+delegation remains in effect until replaced or cleared, making delegate
+correctness, storage isolation, and recovery procedures part of the security
+surface. This makes it
+possible to add a real, on-chain second factor to the exact accounts that today
+have none---without asking users to migrate to a smart-contract wallet.
+
+% --- The gap ---
+What has been missing is a second factor that is (i) \emph{action-bound}: the proof
+authorizes one specific call batch, not a session or a signer; (ii) \emph{non-custodial}:
+no server holds a shared secret; (iii) \emph{replay- and cross-chain-safe}; and
+(iv) portable across a plain EOA (via 7702) and a Safe (via a Module), with one
+authentication circuit family.
+
+% --- Contributions ---
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item \textbf{An action-bound ZK-OTP scheme.} A zero-knowledge proof of knowledge
+  of a registered secret whose challenge is the hash of
+  $(\mathit{chainId}, \mathit{verifyingContract}, \mathit{actionHash}, \mathit{nonce},
+  \mathit{deadline}, \commit)$, so a valid proof authorizes exactly one action on one
+  chain before one deadline (\S\ref{sec:scheme}). The nullifier is derived
+  \emph{in-circuit} and exposed as a public output, closing a malleability gap
+  present in ``nullifier-as-input'' designs.
+  \item \textbf{An EIP-7702 integration} (\texttt{ZkOtpDelegate}) that adds a ZK
+  second factor to a plain EOA without replacing its key, with ERC-7201 namespaced
+  storage and exhaustive public-signal pinning against replay (\S\ref{sec:onchain}).
+  \item \textbf{A Safe Module variant} (\texttt{ZkOtpSafeModule}) that gates
+  \texttt{execTransactionFromModule} on the same proof, giving institutions
+  per-action ZK authorization on top of existing multisig (\S\ref{sec:safe}).
+  \item \textbf{Registration and rotation circuits} that prevent commitment-griefing
+  and enable key rotation without lockout (\S\ref{sec:circuits}).
+  \item \textbf{A security analysis} against a defined threat model, and an
+  implementation over Poseidon/BN254 with Groth16, evaluated on constraint count,
+  proof size, on-chain verification gas, and end-to-end proof generation latency
+  (\S\ref{sec:security}--\S\ref{sec:eval}). We discuss transparent FRI-based
+  proving as the natural migration path for deployments that require no trusted
+  setup or post-quantum assumptions.
+\end{enumerate}
+
+\section{Background}
+\label{sec:background}
+
+\paragraph{EIP-7702 delegation.} EIP-7702 introduces a set-code transaction whose
+authorization tuple signs $(\mathit{chainId}, \mathit{address}, \mathit{nonce})$.
+The protocol writes a delegation indicator into the EOA's code; subsequent calls
+load code from the delegated address and execute it in the EOA's context. A
+$\mathit{chainId}=0$ authorization is valid across chains, so ZK-OTP requires
+wallets and relayers to use explicit non-zero chain identifiers.
+
+\paragraph{ZK proof systems.} Groth16 gives succinct, constant-size proofs and
+cheap on-chain verification, but it is pairing-based, quantum-vulnerable, and
+requires a per-circuit trusted setup. Transparent FRI/STARK systems remove the
+trusted setup and are the natural post-quantum migration path, at the cost of
+larger proofs and higher verification cost.
+
+\paragraph{Poseidon over BN254.} The implementation uses circomlib Poseidon~\cite{poseidon} over
+BN254 (Table~\ref{tab:params}), matching the deployed Circom/Groth16 toolchain.
+Changing the hash or field is a parameter migration: it requires regenerating
+circuits, verifiers, test vectors, and benchmarks.
+
+\paragraph{Safe modules and OTP.} Safe modules can execute transactions through
+\texttt{execTransactionFromModule} once enabled by the Safe. Classical TOTP
+assumes a shared secret and a time window; on-chain hash-chain OTP variants avoid
+a server but consume or reveal a finite sequence. Neither form is naturally bound
+to the full transaction semantics without additional protocol machinery.
+
+\section{Threat Model and Goals}
+\label{sec:threat}
+
+\paragraph{System and assets.} A user controls an EOA key $k$ and a ZK secret
+$\secret \in \Fr$. The protected asset is the authority to execute a specific call
+batch from the EOA (7702) or Safe. The ZK factor is \emph{additive}: it does not
+replace $k$.
+
+\paragraph{Adversary.} We consider a PPT network adversary $\mathcal{A}$ who sees all
+transactions and proofs (mempool), can reorder, replay, and submit arbitrary
+transactions on any chain and contract, and may adaptively request honest
+authentications for actions of its choice. Freshness below is always relative to
+actions that were not queried to this honest-authentication oracle. We assume:
+(i) the ZK secret $\secret$ is
+generated uniformly in $\Fr$ and kept client-side (its compromise is a non-goal);
+(ii) the Groth16 common reference string is generated by a ceremony with at least one
+honest contributor (\S\ref{sec:prims}); a subverted CRS breaks knowledge-soundness
+and motivates a transparent FRI migration path; (iii) the wallet faithfully sets
+\texttt{actionHash} to the batch the user intends (action phishing is a UI non-goal);
+and (iv) EIP-7702 delegation authorizations are pinned to a concrete
+\texttt{chainId} (never the $\texttt{chainId}=0$ wildcard), enforced by the
+relayer/wallet.
+
+\paragraph{Security goals.}
+\begin{enumerate}
+  \item \textbf{Action-binding.} A valid proof authorizes exactly the call batch
+  whose \texttt{actionHash} it commits to; it cannot be reused for a different batch.
+  \item \textbf{Replay-resistance.} A proof is consumed by a monotonic nonce and a
+  single-use nullifier; it cannot be replayed on the same chain.
+  \item \textbf{Cross-chain replay-resistance.} The challenge binds \texttt{chainId}
+  and \texttt{verifyingContract}; a proof valid on one chain/contract is invalid
+  elsewhere.
+  \item \textbf{Non-malleability.} The nullifier is uniquely determined by the
+  witness (circuit output), so no third party can transform a valid proof into another
+  accepted proof.
+  \item \textbf{Knowledge-soundness of registration/rotation.} One cannot register
+  or rotate to a commitment whose preimage one does not know.
+  \item \textbf{Expiry.} A proof past its \texttt{deadline} is rejected.
+\end{enumerate}
+
+\paragraph{Non-goals (explicit).} Local device/secret compromise; action phishing
+by a malicious frontend (a wallet-UI problem---the proof faithfully binds whatever
+\texttt{actionHash} it is given); theft of the EOA key $k$ itself (an attacker with
+$k$ can issue a new 7702 delegation to a non-ZK delegate---the factor is additive);
+guardian/social recovery; and bridge/rollup-level attacks. See \S\ref{sec:limits}.
+
+\section{The ZK-OTP Scheme}
+\label{sec:scheme}
+
+\subsection{Overview}
+Three composable layers share the same authentication relation and verifier:
+(1) a ZK-OTP circuit family; (2) \texttt{ZkOtpDelegate}, the EIP-7702 delegate; (3)
+\texttt{ZkOtpSafeModule}. A user \emph{registers} a commitment
+$\commit = \Hash(\secret, \salt)$ once, then \emph{authenticates} each action with a
+fresh proof, and may \emph{rotate} the secret.
+
+\subsection{Primitives}
+\label{sec:prims}
+We instantiate $\Hash$ as circomlib Poseidon over the BN254 scalar field $\Fr$ with the pinned
+parameters of Table~\ref{tab:params}. The Groth16 path yields $\sim$256-byte proofs
+verified in $\sim$250k gas. A future FRI/STARK instantiation would remove trusted
+setup and improve post-quantum posture, at larger proof/verification cost. Plonky3~\cite{plonky3}
+is one candidate implementation direction.
+
+\begin{table}[t]
+\centering
+\caption{Pinned Poseidon/BN254 parameters.}
+\label{tab:params}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+Field & BN254 $\Fr$ ($r = 2188\ldots495617$) \\
+State width $t$ & 3 (2-input), 7 (6-input) \\
+S-box $\alpha$ & 5 \\
+Full rounds $R_F$ & 8 \\
+Partial rounds $R_P$ & 56 ($t{=}3$), 60 ($t{=}7$) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Circuits}
+\label{sec:circuits}
+
+\paragraph{Authentication (\texttt{otp\_auth}).}
+Public signals: $\mathit{chainId}, \mathit{verifyingContract}, \mathit{actionHash},
+\mathit{nonce}, \mathit{deadline}, \commit, \nul$. Witness: $\secret, \salt$.
+Constraints:
+\begin{align}
+  \commit &= \Hash(\secret, \salt), \label{eq:commit}\\
+  \chal   &= \Hash(\mathit{chainId}, \mathit{verifyingContract}, \mathit{actionHash},
+              \mathit{nonce}, \mathit{deadline}, \commit), \label{eq:chal}\\
+  \nul    &= \Hash(\secret, \chal). \label{eq:null}
+\end{align}
+Crucially, $\nul$ is \emph{derived} by \eqref{eq:null} and exposed as a public
+output; the contract reads it from the public signals rather than accepting it as an
+input, so its value is uniquely fixed by the witness.
+
+\paragraph{Registration (\texttt{otp\_register}).}
+Public: $\commit, \mathit{bindingHash}$; witness: $\secret, \salt$. The circuit
+constrains $\commit = \Hash(\secret, \salt)$. The contract separately pins
+$\mathit{bindingHash}$ to
+$\keccak(\commit, \mathit{userAddress}, \mathit{chainId}) \bmod |\Fr|$ before
+calling the verifier. This forces a registrant to know the preimage of $\commit$
+(preventing commitment-slot griefing), while the on-chain check binds the
+registration calldata to an address and chain.
+
+\paragraph{Rotation (\texttt{otp\_rotate}).}
+Public signals: $\mathit{oldC}, \mathit{newC}, \mathit{chainId}, \mathit{verifyingContract},
+\mathit{nonce}, \mathit{deadline}, \nul$; witness: old/new secret and salt.
+Constraints prove knowledge of both preimages and derive the nullifier from the
+\emph{old} secret, so rotation both proves current ownership and installs a
+known new commitment---no lockout, no rotation to an unknown key.
+
+\subsection{On-chain: the EIP-7702 Delegate}
+\label{sec:onchain}
+\texttt{ZkOtpDelegate} stores $(\commit, \mathit{nonce}, \text{used nullifiers})$ in
+an ERC-7201 namespaced slot~\cite{erc7201} to avoid collisions under delegation. On
+\texttt{executeWithProof(calls, proof, publicSignals)} it (i) recomputes each public
+signal from runtime state (\texttt{block.chainid}, \texttt{address(this)},
+$\keccak(\text{calls}) \bmod |\Fr|$, stored nonce, current time bound) and reverts on any
+mismatch (\emph{public-signal pinning}); (ii) rejects a used nullifier; (iii) calls
+the Groth16 verifier; (iv) marks the nullifier used and increments the nonce
+\emph{before} executing \texttt{calls} (effects-before-interactions). Every
+state-changing entry point is either \texttt{onlySelf} or proof-gated.
+
+The call encoding is part of the trusted protocol surface: each batch item must
+include the target address, ETH value, and calldata (and, for Safe, the Safe address
+and module address). Binding calldata alone is insufficient, because value-bearing
+calls would otherwise leave \texttt{msg.value} or per-call value outside the proved
+statement. The resulting digest is reduced into $\Fr$ only after hashing a canonical
+byte encoding; implementations should reject non-canonical encodings and document the
+field-reduction rule used by both Solidity and Circom.
+
+\subsection{Safe Module}
+\label{sec:safe}
+\texttt{ZkOtpSafeModule} gates \texttt{execTransactionFromModule} on the same
+\texttt{otp\_auth} proof, so an institution's existing $m$-of-$n$ Safe additionally
+requires a per-action ZK factor. The Safe setting has a different operational
+surface from the EIP-7702 delegate: the Safe owner set, module enablement, and
+module-disable procedures remain part of the institution's custody policy and
+must be audited alongside the module.
+
+\subsection{Off-chain prover}
+\label{sec:prover}
+The prover derives witness values from a client-held secret stored in an OS
+keychain, secure enclave, HSM, or equivalent secret store. It computes the
+Poseidon commitment/nullifier witness, generates the Groth16 proof, and passes
+the proof plus public signals to the wallet or relayer. Before proof generation,
+the wallet must decode the call batch into human-readable intent and display the
+exact action whose hash will be bound into the circuit; otherwise ZK-OTP would
+faithfully authorize a maliciously supplied \texttt{actionHash}.
+
+\section{Security Analysis}
+\label{sec:security}
+
+\subsection{Assumptions}
+\label{sec:assumptions}
+Let $\Pi=(\mathsf{Setup},\mathsf{Prove},\mathsf{Vfy})$ be the Groth16 argument for an
+NP relation $R$.
+
+\begin{definition}[Knowledge soundness]
+$\Pi$ is knowledge-sound if for every PPT prover $\mathcal{P}^*$ there is a PPT
+extractor $\mathcal{E}$ such that, whenever $\mathcal{P}^*$ outputs $(x,\pi)$ with
+$\mathsf{Vfy}(vk,x,\pi)=1$, $\mathcal{E}$ (given $\mathcal{P}^*$'s coins) outputs $w$
+with $(x,w)\in R$, except with probability $\epsilon_{\mathrm{ks}}(\lambda)$.
+\end{definition}
+
+For Groth16, this is the standard knowledge-soundness assumption under the
+algebraic/generic group style models used in succinct-argument analyses, conditioned
+on a correctly generated CRS.
+
+We model $\Hash$ (Poseidon over $\Fr$) as collision-resistant and preimage-resistant,
+with advantages $\epsilon_{\mathrm{cr}},\epsilon_{\mathrm{pre}}$, and $\keccak$ as
+collision-resistant. All named $\epsilon(\cdot)$ are negligible in $\lambda$ under a
+correctly generated CRS (assumption (ii) of \S\ref{sec:threat}); a subverted CRS
+voids $\epsilon_{\mathrm{ks}}$.
+
+\subsection{Relations and on-chain acceptance}
+The authentication circuit fixes the relation
+\[
+R_{\mathrm{auth}}=\Big\{\big(x=(\mathit{cid},\mathit{vc},\mathit{ah},\mathit{nc},
+\mathit{dl},\commit,\nul);\, w=(\secret,\salt)\big):
+\commit=\Hash(\secret,\salt)\,\wedge\,\nul=\Hash(\secret,\chal)\Big\},
+\]
+with $\chal=\Hash(\mathit{cid},\mathit{vc},\mathit{ah},\mathit{nc},\mathit{dl},\commit)$
+as in \eqref{eq:chal}. $R_{\mathrm{reg}}$ fixes $\commit=\Hash(\secret,\salt)$;
+$R_{\mathrm{rot}}$ fixes both preimages and a nullifier under the \emph{old} secret.
+
+The delegate maintains state $(\mathit{cid}^*,\mathit{vc}^*,\mathit{nc}^*,\commit^*,
+\mathsf{Used})$ and, at wall-clock $t$, \textbf{accepts} a submission
+$(\mathsf{calls},x,\pi)$ iff
+\begin{enumerate}\itemsep2pt
+\item[\textbf{(P)}] \emph{pinning}: $\mathit{cid}=\mathit{cid}^*$, $\mathit{vc}=\mathit{vc}^*$,
+$\mathit{ah}=\keccak(\mathsf{encodeCalls}(\mathsf{calls})) \bmod |\Fr|$, $\mathit{nc}=\mathit{nc}^*$,
+$\commit=\commit^*$, and $t\le \mathit{dl}$;
+\item[\textbf{(U)}] \emph{freshness}: $\nul\notin\mathsf{Used}$;
+\item[\textbf{(V)}] \emph{validity}: $\mathsf{Vfy}(vk_{\mathrm{auth}},x,\pi)=1$.
+\end{enumerate}
+On acceptance it sets $\mathsf{Used}\mathrel{+}=\{\nul\}$, increments
+$\mathit{nc}^*$, then executes $\mathsf{calls}$ (effects before interactions).
+The monotonic nonce provides strict per-account ordering and state synchronization;
+the nullifier provides proof-level replay protection independent of proof bytes and
+remains necessary for rotation and for malleability-safe consumption semantics. A
+future unordered variant could replace the monotonic nonce with independent action
+identifiers or a nullifier bitmap, at the cost of a different concurrency model.
+
+\subsection{Guarantees}
+
+\begin{theorem}[Action unforgeability]
+\label{thm:unforge}
+Fix an honestly registered $\commit^*=\Hash(\secret,\salt)$ with $\secret$ hidden from
+$\mathcal{A}$. After adaptively obtaining accepting submissions from an honest
+prover for actions $\mathsf{calls}_1,\dots,\mathsf{calls}_q$, no PPT $\mathcal{A}$ causes the delegate to
+accept a submission for a \emph{fresh} action $\mathsf{calls}^*$ (with
+$\keccak(\mathsf{encodeCalls}(\mathsf{calls}^*))\neq
+\keccak(\mathsf{encodeCalls}(\mathsf{calls}_i))\,\forall i$) except with
+probability at most $\epsilon_{\mathrm{ks}}+\epsilon_{\mathrm{pre}}+\epsilon_{\mathrm{cr}}$.
+\end{theorem}
+\begin{proof}
+A winning submission satisfies (P), so its statement has $\commit=\commit^*$ and
+$\mathit{ah}=\keccak(\mathsf{encodeCalls}(\mathsf{calls}^*)) \bmod |\Fr|$, and satisfies (V). By knowledge soundness,
+$\mathcal{E}$ extracts $(\secret',\salt')$ with $\commit^*=\Hash(\secret',\salt')$,
+except with $\epsilon_{\mathrm{ks}}$. Two cases. If $(\secret',\salt')=(\secret,\salt)$,
+then $\mathcal{A}$ (via $\mathcal{E}$) has produced $\secret$, a preimage of the given
+$\commit^*$ it was never told---a preimage-finder with advantage bounded by
+$\epsilon_{\mathrm{pre}}$. If $(\secret',\salt')\neq(\secret,\salt)$, the two pairs are
+a collision on $\Hash$, bounded by $\epsilon_{\mathrm{cr}}$. Summing bounds the event.
+Crucially, $\mathit{ah}$ is a \emph{pinned public signal}: the extracted witness
+authorizes exactly $\mathsf{calls}^*$, so knowledge of $\secret$ is what a fresh
+action costs.
+\end{proof}
+
+\begin{theorem}[Replay resistance]
+\label{thm:replay}
+No accepting submission can be accepted twice, and two accepting submissions for
+distinct $(\mathit{ah},\mathit{nc})$ carry distinct nullifiers except with
+probability $\epsilon_{\mathrm{cr}}$.
+\end{theorem}
+\begin{proof}
+Acceptance adds $\nul$ to $\mathsf{Used}$; a resubmission of the same $x$ fails (U).
+A submission reusing the proof under a new state fails (P) because $\mathit{nc}$ is
+pinned to the incremented $\mathit{nc}^*$. Distinctness: $\nul=\Hash(\secret,\chal)$ and
+$\chal$ binds $(\mathit{ah},\mathit{nc})$; equal nullifiers for distinct
+$(\mathit{ah},\mathit{nc})$ yield an $\Hash$-collision, bounded by $\epsilon_{\mathrm{cr}}$,
+so the single-use set never conflates two genuinely different authorizations.
+\end{proof}
+
+\begin{theorem}[Cross-chain / cross-contract resistance]
+\label{thm:xchain}
+A proof accepted at $(\mathit{cid}^*,\mathit{vc}^*)$ is rejected at any
+$(\mathit{cid}',\mathit{vc}')\neq(\mathit{cid}^*,\mathit{vc}^*)$; forging a fresh
+acceptance there reduces to Theorem~\ref{thm:unforge}.
+\end{theorem}
+\begin{proof}
+$\mathit{cid},\mathit{vc}$ are pinned by (P), so replaying $(x,\pi)$ elsewhere fails
+before verification. A \emph{new} accepting statement for $(\mathit{cid}',\mathit{vc}')$
+has these values folded into $\chal$ and hence into $R_{\mathrm{auth}}$; producing it
+without $\secret$ contradicts Theorem~\ref{thm:unforge}. Assumption~(iv)
+(no $\mathit{chainId}=0$ delegation) prevents the orthogonal 7702 hazard of installing
+the delegate cross-chain.
+\end{proof}
+
+\begin{theorem}[Non-malleability of authorization]
+\label{thm:nonmal}
+Groth16 proof re-randomization does not enable replay or nullifier substitution.
+\end{theorem}
+\begin{proof}
+Freshness (U) and the used-set key on $\nul$, a \emph{public signal} in $x$, not on
+the proof bytes $\pi$. Groth16 proofs are re-randomizable, so an adversary can derive
+$\pi'\neq\pi$ for the same $x$; but $x$ (hence $\nul$) is unchanged, so (U) still
+rejects. To obtain a \emph{different} accepted $\nul'$ for the same action, the
+adversary needs a witness with $\Hash(\secret,\chal)=\nul'\neq\Hash(\secret,\chal)$---
+impossible for a fixed witness, and finding a second witness is an $\Hash$-collision
+($\epsilon_{\mathrm{cr}}$). Thus binding replay protection to the circuit-output
+nullifier, rather than to $\pi$, sidesteps Groth16 malleability by construction.
+\end{proof}
+
+\begin{theorem}[Registration/rotation soundness]
+\label{thm:reg}
+An accepting \texttt{register} (resp.\ \texttt{rotate}) implies the submitter knows a
+preimage of the (new) commitment, except with $\epsilon_{\mathrm{ks}}$.
+\end{theorem}
+\begin{proof}
+By knowledge soundness on $R_{\mathrm{reg}}$ ($R_{\mathrm{rot}}$), extract
+$(\secret,\salt)$ with $\commit=\Hash(\secret,\salt)$ (and, for rotation, the old
+preimage witnessed by the nullifier under $\secret_{\mathrm{old}}$ plus
+$\commit_{\mathrm{new}}=\Hash(\secret_{\mathrm{new}},\salt_{\mathrm{new}})$). Hence one
+cannot claim a commitment slot for a value one cannot later authenticate with
+(anti-griefing), nor rotate to an unknown key (no lockout). The domain tag
+$\keccak(\commit,\mathit{account},\mathit{cid})\bmod \Fr$ is checked on-chain against
+the public \texttt{bindingHash}, binding the commitment to one account and chain.
+\end{proof}
+
+\paragraph{Expiry and secrecy.} Expiry is immediate from (P): $t\le\mathit{dl}$.
+Zero-knowledge of $\Pi$ keeps $\secret$ hidden across the $q$ observed proofs, so the
+$\epsilon_{\mathrm{pre}}$ reduction in Theorem~\ref{thm:unforge} is against an
+adversary that learns nothing about $\secret$ from transcripts.
+
+\paragraph{Scope of the argument.} These are game-based reductions to $\Pi$'s
+knowledge soundness and $\Hash,\keccak$ collision/preimage resistance. We do not claim
+a UC treatment of the delegate state machine; the argument models the on-chain
+contract as the explicit acceptance predicate above.
+
+\section{Implementation and Evaluation}
+\label{sec:eval}
+We implement the three circuits in Circom~2.1.6 over BN254 with circomlib's Poseidon,
+compile to R1CS, and generate a Groth16 proving/verifying key per circuit via a
+Powers-of-Tau ($2^{12}$) plus per-circuit Phase-2 setup. The snarkjs-exported
+Solidity verifiers are wired into the \texttt{ZkOtpDelegate} and
+\texttt{ZkOtpSafeModule} contracts and exercised end-to-end: proofs generated
+off-chain verify both off-chain and on-chain. Table~\ref{tab:eval} reports measured
+figures; the full pipeline (constraint counts, setup, proof generation, gas) is
+scripted and reproducible.
+
+\begin{table}[t]
+\centering
+\caption{Measured evaluation. Gas via Foundry; proving time is the reproducible snarkjs
+pipeline measurement (witness generation $+$ Groth16 proof) on a desktop/laptop
+development machine.}
+\label{tab:eval}
+\begin{tabular}{lcccc}
+\toprule
+Circuit & R1CS constraints & Proof size & On-chain verify gas & Prove time \\
+\midrule
+\texttt{otp\_auth}     & 834  & 256\,B & 231{,}080 & 581\,ms \\
+\texttt{otp\_register} & 240  & 256\,B & 197{,}504 & 683\,ms \\
+\texttt{otp\_rotate}   & 1074 & 256\,B & 231{,}080 & 887\,ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All circuits are well under the $5{,}000$-constraint budget; Groth16 proofs are the
+canonical eight field elements ($256$~bytes of calldata) and verify on-chain in
+$\approx\!200$--$231$k gas (\texttt{register} is cheaper: two public signals vs.\
+seven). The additional on-chain hashing for canonical \texttt{encodeCalls} is linear
+in the encoded batch size and small relative to pairing verification for standard
+interactive transactions. End-to-end proof generation in the reproducible snarkjs
+pipeline takes
+$581$--$887$\,ms. These figures are sufficient for interactive authorization, but
+we leave mobile-device latency, transparent-FRI proof size/gas, and full
+\texttt{executeWithProof} gas (verifier plus public-signal pinning, storage, and
+scenario calls) to future evaluation.
+
+\paragraph{Reproducibility and honest scope.} The measurements above use real
+Groth16 proofs and exported Solidity verifiers; the end-to-end contract tests accept
+valid proofs on-chain. The Phase-2 setup used here is a fixed-entropy
+\emph{measurement} build; a production deployment requires a multi-contributor
+ceremony (\S\ref{sec:prims}) or a transparent proving backend. This paper reports
+a measured research prototype, not an audited production
+system.
+
+\section{Discussion and Limitations}
+\label{sec:limits}
+We restate, and where possible bound, what ZK-OTP does \emph{not} solve.
+
+\paragraph{Device and secret compromise.} The security argument assumes $\secret$ is
+secret (\S\ref{sec:threat}). Malware that reads $\secret$ from client storage defeats
+the factor; zero knowledge protects the secret in transit and on-chain, not at rest.
+Hardware-bound storage (Secure Enclave, YubiKey-class, or a Pico-HSM bridge)
+\emph{mitigates} by making $\secret$ non-exportable and moving proving into the
+device, but does not eliminate a fully compromised host.
+
+\paragraph{Action phishing.} The proof faithfully binds whatever \texttt{actionHash}
+it is given; if a malicious frontend asks the user to authorize batch $X$ but proves
+batch $Y$, the on-chain check still passes for $Y$. Defense is wallet-side: the signer
+must decode \texttt{actionHash} into a human-readable operation before proving. This is
+a UI obligation we make explicit, not a contract property.
+
+\paragraph{EOA key theft (the additivity boundary).} ZK-OTP is an \emph{additive}
+factor. An attacker holding the EOA key $k$ can issue a fresh EIP-7702 authorization
+delegating to a \emph{different}, non-ZK contract, bypassing the factor entirely. Thus
+ZK-OTP raises the bar (two independent secrets now required for a protected action) but
+does not, alone, survive full key theft; pairing it with a Safe whose owner set is not
+the single EOA (\S\ref{sec:safe}) closes this for the institutional tier.
+
+\paragraph{Recovery.} We deliberately omit guardian/social recovery: it would become
+the weakest link and expand the threat surface. Key rotation (\S\ref{sec:circuits})
+covers planned secret changes. In the Safe module, loss of $\secret$ without a prior
+rotation is unrecoverable unless the Safe's owners disable or replace the module
+through their normal governance path. In the EIP-7702 EOA setting, the base EOA key
+$k$ is an ultimate recovery hatch: a legitimate user who still controls $k$ can clear
+or replace the delegate, just as an attacker with $k$ can bypass it. This is the
+same additivity boundary as above, not an extra recovery protocol.
+
+\paragraph{Mempool exposure and deadlines.} A valid proof in the mempool is exposed
+exactly as any signed transaction is; the single-use nullifier and short
+\texttt{deadline} (we recommend $5$\,min for routine actions, $60$\,s for high-value)
+bound the window. Front-running the \emph{action} is prevented by action-binding
+(Theorem~\ref{thm:unforge}); front-running the \emph{inclusion} is a general L1 issue.
+
+\paragraph{Quantum and the gas/PQ trade-off.} The Groth16 back end is pairing-based
+and quantum-vulnerable, and it requires a trusted CRS. A transparent FRI/STARK
+instantiation would remove both concerns at higher proof size and verification
+gas. We therefore treat Groth16 as the measured high-frequency path and transparent
+proving as a migration target for treasury or institutional operations where
+no-trusted-setup assumptions dominate cost.
+
+\paragraph{Cross-domain scope.} ZK-OTP protects EOA- and Safe-level authorization on
+one chain/contract. Cross-chain and rollup-specific attacks (poisoned RPCs, sequencer
+or validator compromise, bridge failures) are out of scope and orthogonal. The
+\texttt{chainId} binding prevents ordinary cross-chain replay, but it does not
+distinguish two forked histories that intentionally or temporarily share the same
+\texttt{chainId}; deployments that care about such forks should include an additional
+domain separator, such as a deployment-specific fork identifier or finalized genesis
+anchor, in the action hash.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Account abstraction as a platform.} ERC-4337~\cite{erc4337} routes
+\emph{UserOperations} through an EntryPoint and lets a smart-contract account run
+arbitrary validation logic, enabling plugin architectures (session keys, spending
+limits, guardians). It does not, however, retrofit an \emph{existing} EOA: a user
+must adopt a 4337 smart account. EIP-7702~\cite{eip7702} closes exactly this gap by
+letting a plain EOA delegate its code in-place. ZK-OTP targets the 7702 setting
+directly---adding a cryptographic second factor to the accounts that hold the bulk of
+retail funds today---while remaining deployable as a 4337/Safe module. Session-key and
+guardian modules~\cite{safe} are \emph{policy} layers (who may act, up to what limit);
+they are complementary to, not a substitute for, a per-action secret-knowledge factor.
+For 4337-style deployment, ERC-7562 validation-scope rules~\cite{erc7562} are relevant:
+ZK-OTP's validation is static and non-interactive from the bundler's perspective, but
+an implementation must keep proof verification and storage reads within the allowed
+validation surface and storage-access rules.
+
+\paragraph{Passkeys and WebAuthn on-chain.} A growing line of AA wallets use
+WebAuthn/FIDO2 passkeys~\cite{webauthn} as a signer, verifying secp256r1 signatures
+on-chain via custom verifiers or the RIP-7212 precompile~\cite{rip7212}. Passkeys give
+excellent hardware binding and UX, and a wallet can include transaction semantics in
+the signed challenge, giving a public-key analogue of transaction confirmation. Their
+primitive, however, is public-key/device authentication:
+the account registers or verifies a public key and later checks signatures. ZK-OTP is
+orthogonal and composable: a passkey can gate \emph{who} may prove, while the ZK-OTP
+proof binds \emph{what} is authorized using a hidden secret and nullifier-based replay
+protection. Hardware-bound secret storage (Secure Enclave, HSM) is our recommended
+deployment for the ZK secret as well.
+
+\paragraph{TOTP and hash-based OTP.} RFC-6238 TOTP~\cite{totp} is a shared-secret,
+time-window authenticator: the verifier must know enough state to check the code, and
+the code is not bound to a particular on-chain call. Hash-locked or Lamport-style
+on-chain OTPs avoid a server, but they commit to a finite sequence and naturally
+authorize possession of a token rather than a full transaction semantic. ZK-OTP keeps
+no secret on-chain, is single-use via an in-circuit nullifier, is rotatable
+(\S\ref{sec:circuits}), and is action-bound.
+
+\paragraph{Nullifier-based ZK protocols.} Semaphore~\cite{semaphore} and mixer designs
+such as Tornado Cash~\cite{tornado} popularised proving knowledge of a secret behind a
+commitment while emitting a nullifier to prevent double-use, primarily for
+\emph{anonymity} (set membership, unlinkable signaling/withdrawal). We reuse the
+commitment/nullifier idiom but for a different end: the nullifier is derived from a
+challenge over the \emph{action} (\S\ref{sec:scheme}), turning it into single-use
+\emph{authorization} rather than anonymous signaling, and we add the register/rotate
+lifecycle and the EOA/Safe integrations. Anonymity is explicitly \emph{not} a goal.
+MACI~\cite{maci} is another important Ethereum ZK system using on-chain verification
+to enforce correct private actions, but its goal is private, anti-collusion voting
+under a coordinator model rather than per-account second-factor authorization.
+
+\paragraph{ZK login and credential proofs.} zkLogin-style and keyless-account systems
+prove possession of a Web2 (OAuth/OIDC/JWT) credential in zero knowledge to derive or
+unlock an account~\cite{zklogin}. These target onboarding/identity from off-chain
+credentials, not a per-action second factor over on-chain calls; the two can coexist
+(ZK login to derive the account, ZK-OTP to authorize each sensitive action).
+
+\paragraph{Threshold/MPC custody.} Multisig (Safe), threshold ECDSA, and commercial
+MPC custody protect the \emph{key material} and distribute \emph{who} signs. They do
+not by themselves prove knowledge of an independent second secret bound to the
+operation semantics. ZK-OTP composes on top via a Safe module (\S\ref{sec:safe}),
+adding an additive, per-action ZK factor over any such account.
+
+\paragraph{Proof malleability.} Groth16~\cite{groth16} proofs are re-randomizable;
+simulation-extractable SNARKs (e.g., GM17~\cite{gm17}) remove this at some cost. We
+instead neutralise malleability at the protocol layer by keying replay protection on
+the nullifier public signal rather than the proof bytes (Theorem~\ref{thm:nonmal}), so
+the construction is not dependent on proof-byte uniqueness.
+
+\paragraph{The gap.} To our knowledge, no prior system provides a second factor that
+is simultaneously (i) \emph{action-bound} to a specific call batch/chain/contract/
+nonce/deadline, (ii) \emph{non-custodial and secret-hiding} via zero knowledge,
+(iii) attachable to a \emph{plain EOA} through EIP-7702 without migration or key
+replacement, and (iv) realised by the same authentication circuit family across EOA
+and institutional Safe deployments. ZK-OTP occupies this intersection.
+
+\section{Conclusion}
+ZK-OTP is a second factor for blockchain accounts that is bound to a specific action
+rather than to a session or a signer, hides its secret in zero knowledge, and---via
+EIP-7702---attaches to the plain EOAs that today have no second factor at all, using
+the same authentication circuit family for an institutional Safe module. We gave game-based
+security reductions to Groth16 knowledge-soundness and Poseidon/keccak
+collision/preimage resistance, including a construction-level defense that makes
+Groth16's proof malleability irrelevant, and a measured implementation:
+$240$--$1074$ R1CS constraints, $256$-byte proofs, $198$--$231$k gas on-chain, and
+desktop proof generation in $581$--$887$\,ms. The natural next steps are a production trusted-setup
+ceremony, a transparent proving back end for the institutional tier, and an external
+audit of the delegate and Safe module.
+
+\begin{thebibliography}{99}
+\bibitem{eip7702} V. Buterin, S. Wilson, A. Dietrichs, and lightclient. \emph{EIP-7702: Set Code for EOAs}. Ethereum Improvement Proposals, 2024. \url{https://eips.ethereum.org/EIPS/eip-7702}.
+\bibitem{erc4337} V. Buterin et al. \emph{ERC-4337: Account Abstraction Using Alt Mempool}. Ethereum Improvement Proposals, 2021. \url{https://eips.ethereum.org/EIPS/eip-4337}.
+\bibitem{groth16} J. Groth. \emph{On the Size of Pairing-Based Non-Interactive Arguments}. EUROCRYPT 2016.
+\bibitem{poseidon} L. Grassi et al. \emph{Poseidon: A New Hash Function for Zero-Knowledge Proof Systems}. USENIX Security 2021.
+\bibitem{semaphore} Semaphore. \emph{Semaphore: Anonymous signaling protocol}. \url{https://semaphore.pse.dev/}.
+\bibitem{safe} Safe. \emph{Safe Smart Accounts and Modules}. \url{https://docs.safe.global/}.
+\bibitem{erc7201} J. Amadi et al. \emph{ERC-7201: Namespaced Storage Layout}. Ethereum Improvement Proposals, 2023. \url{https://eips.ethereum.org/EIPS/eip-7201}.
+\bibitem{erc7562} ERC-7562 authors. \emph{ERC-7562: Account Abstraction Validation Scope Rules}. Ethereum Improvement Proposals. \url{https://eips.ethereum.org/EIPS/eip-7562}.
+\bibitem{plonky3} Polygon Zero. \emph{Plonky3}. \url{https://github.com/Plonky3/Plonky3}.
+\bibitem{totp} D. M'Raihi et al. \emph{RFC 6238: TOTP}. IETF, 2011.
+\bibitem{webauthn} W3C. \emph{Web Authentication: An API for accessing Public Key Credentials Level 2}. W3C Recommendation, 2021. \url{https://www.w3.org/TR/webauthn-2/}.
+\bibitem{rip7212} A. Beregszaszi et al. \emph{RIP-7212: Precompile for secp256r1 curve support}. Ethereum Rollup Improvement Proposals. \url{https://github.com/ethereum/RIPs/blob/master/RIPS/rip-7212.md}.
+\bibitem{tornado} A. Pertsev, R. Semenov, and R. Storm. \emph{Tornado Cash}. \url{https://tornado.cash/}.
+\bibitem{maci} Privacy and Scaling Explorations. \emph{MACI: Minimum Anti-Collusion Infrastructure}. \url{https://maci.pse.dev/}.
+\bibitem{zklogin} Mysten Labs. \emph{zkLogin}. \url{https://docs.sui.io/concepts/cryptography/zklogin}.
+\bibitem{gm17} J. Groth, M. Maller. \emph{Snarky Signatures: Simulation-Extractable SNARKs}. CRYPTO 2017.
+\end{thebibliography}
+
+\end{document}

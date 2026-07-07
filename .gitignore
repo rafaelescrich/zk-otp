@@ -1,0 +1,40 @@
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log*
+dist/
+
+# Circom/snarkjs generated artifacts
+circuits/build/
+trusted-setup/ptau/*.ptau
+trusted-setup/ceremony/*.ptau
+trusted-setup/ceremony/*.zkey
+trusted-setup/ceremony/*.r1cs
+trusted-setup/ceremony/*.wasm
+trusted-setup/ceremony/*.sym
+trusted-setup/ceremony/*.json
+
+# Foundry
+contracts/lib/
+contracts/out/
+contracts/cache/
+broadcast/
+
+# LaTeX
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+
+# Secrets / local env
+.env
+.env.*
+*.key
+*.pem
+*.secret

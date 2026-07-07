@@ -1,0 +1,11 @@
+{
+  "implementation": "circomlibjs@0.1.7 Poseidon, BN254",
+  "note": "Regenerate and replace these after pinning a strict Poseidon2 implementation.",
+  "vectors": [
+    { "inputs": ["0", "0"], "output": "pending" },
+    { "inputs": ["1", "2"], "output": "pending" },
+    { "inputs": ["123456789", "987654321"], "output": "pending" },
+    { "inputs": ["42", "7", "1", "2", "3", "4"], "output": "pending" },
+    { "inputs": ["21888242871839275222246405745257275088548364400416034343698204186575808495", "9"], "output": "pending" }
+  ]
+}

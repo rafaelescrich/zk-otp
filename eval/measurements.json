@@ -1,0 +1,5 @@
+{
+  "auth": {"constraints": 834, "prove_ms": 581, "proof_json_bytes": 805, "verify_ok": true},
+  "register": {"constraints": 240, "prove_ms": 683, "proof_json_bytes": 806, "verify_ok": true},
+  "rotate": {"constraints": 1074, "prove_ms": 887, "proof_json_bytes": 804, "verify_ok": true}
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@rafaelescrich/zk-otp-circuits",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:circom": "node scripts/check-circom-version.mjs",
+    "compile:auth": "npm run check:circom && circom otp_auth.circom -l node_modules --r1cs --wasm --sym -o build/auth",
+    "compile:register": "npm run check:circom && circom otp_register.circom -l node_modules --r1cs --wasm --sym -o build/register",
+    "compile:rotate": "npm run check:circom && circom otp_rotate.circom -l node_modules --r1cs --wasm --sym -o build/rotate",
+    "compile": "mkdir -p build/auth build/register build/rotate && npm run compile:auth && npm run compile:register && npm run compile:rotate",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "circomlib": "2.0.5",
+    "circomlibjs": "0.1.7",
+    "ffjavascript": "0.3.0"
+  },
+  "devDependencies": {
+    "circom_tester": "0.0.24"
+  }
+}
