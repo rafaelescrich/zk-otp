@@ -53,7 +53,8 @@ and malleability-resistance, and an implementation over Poseidon/BN254 with a
 Groth16 proving path plus a migration path to transparent FRI-based proving.
 Across the three circuits ($240$--$1074$ R1CS constraints), Groth16 proofs are
 $256$~bytes, verify on-chain in $198$--$231$k gas, and generate in
-$581$--$887$\,ms in the reproducible snarkjs pipeline.
+$581$--$887$\,ms in the reproducible snarkjs pipeline. The reference
+implementation is available at \url{https://github.com/rafaelescrich/zk-otp}.
 \end{abstract}
 
 \section{Introduction}
@@ -112,6 +113,10 @@ authentication circuit family.
   proving as the natural migration path for deployments that require no trusted
   setup or post-quantum assumptions.
 \end{enumerate}
+
+The reference Circom circuits, Solidity contracts, exported Groth16 verifiers,
+test vectors, and reproducible evaluation artifacts are open source at
+\url{https://github.com/rafaelescrich/zk-otp}.
 
 \section{Background}
 \label{sec:background}
